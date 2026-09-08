@@ -1,4 +1,4 @@
-gym
+gymnasium[classic-control]
 nevergrad
 numpy
 ray
@@ -6,3 +6,4 @@ seaborn
 tensorboard
 torch
 python-chess
+pygame==2.1.3

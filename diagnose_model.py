@@ -39,7 +39,7 @@ class DiagnoseModel:
         root, mcts_info = MCTS(self.config).run(
             self.model, observation, self.config.action_space, to_play, True
         )
-        trajectory_info.store_info(root, mcts_info, None, numpy.NaN)
+        trajectory_info.store_info(root, mcts_info, None, numpy.nan)
 
         virtual_to_play = to_play
         for i in range(horizon):
@@ -105,7 +105,7 @@ class DiagnoseModel:
             True,
         )
         self.plot_mcts(root, plot)
-        real_trajectory_info.store_info(root, mcts_info, None, numpy.NaN)
+        real_trajectory_info.store_info(root, mcts_info, None, numpy.nan)
         for i, action in enumerate(virtual_trajectory_info.action_history):
             # Follow virtual trajectory until it reaches an illegal move in the real env
             if action not in game.legal_actions():
@@ -206,10 +206,10 @@ class Trajectoryinfo:
         self.policies_after_planning = []
         # Not implemented, need to store them in every nodes of the mcts
         self.prior_values = []
-        self.values_after_planning = [[numpy.NaN] * len(self.config.action_space)]
+        self.values_after_planning = [[numpy.nan] * len(self.config.action_space)]
         self.prior_root_value = []
         self.root_value_after_planning = []
-        self.prior_rewards = [[numpy.NaN] * len(self.config.action_space)]
+        self.prior_rewards = [[numpy.nan] * len(self.config.action_space)]
         self.mcts_depth = []
 
     def store_info(self, root, mcts_info, action, reward, new_prior_root_value=None):
@@ -221,7 +221,7 @@ class Trajectoryinfo:
             [
                 root.children[action].prior
                 if action in root.children.keys()
-                else numpy.NaN
+                else numpy.nan
                 for action in self.config.action_space
             ]
         )
@@ -229,7 +229,7 @@ class Trajectoryinfo:
             [
                 root.children[action].visit_count / self.config.num_simulations
                 if action in root.children.keys()
-                else numpy.NaN
+                else numpy.nan
                 for action in self.config.action_space
             ]
         )
@@ -237,7 +237,7 @@ class Trajectoryinfo:
             [
                 root.children[action].value()
                 if action in root.children.keys()
-                else numpy.NaN
+                else numpy.nan
                 for action in self.config.action_space
             ]
         )
@@ -251,7 +251,7 @@ class Trajectoryinfo:
             [
                 root.children[action].reward
                 if action in root.children.keys()
-                else numpy.NaN
+                else numpy.nan
                 for action in self.config.action_space
             ]
         )

@@ -1,7 +1,7 @@
 import datetime
 import pathlib
 
-import gym
+import gymnasium as gym
 import numpy
 import torch
 
@@ -130,52 +130,75 @@ class MuZeroConfig:
 
 class Game(AbstractGame):
     """
-    Game wrapper.
+    Gymnasium CartPole game wrapper.
     """
 
-    def __init__(self, seed=None):
-        self.env = gym.make("CartPole-v1")
-        if seed is not None:
-            self.env.seed(seed)
+    default_render_mode = None
+
+    def __init__(self, seed=None, render_mode=None):
+        self.seed = seed
+
+        if render_mode is None:
+            render_mode = self.default_render_mode
+
+        self.render_mode = render_mode
+        self.env = gym.make(
+            "CartPole-v1",
+            render_mode=render_mode
+        )
+
+        # Gymnasium performs seeding through reset(seed=...).
+        # Keep the initial observation available for callers that need it.
+        self._observation, _ = self.env.reset(seed=seed)
 
     def step(self, action):
         """
-        Apply action to the game.
+        Apply an action to the game.
 
         Args:
-            action : action of the action_space to take.
+            action: Action from the configured action space.
 
         Returns:
-            The new observation, the reward and a boolean if the game has ended.
+            A tuple containing:
+                - the new observation
+                - the reward
+                - whether the game has ended
         """
-        observation, reward, done, _ = self.env.step(action)
-        return numpy.array([[observation]]), reward, done
+        observation, reward, terminated, truncated, _ = self.env.step(action)
+
+        # Gymnasium separates natural termination from time-limit truncation.
+        # MuZero expects one boolean indicating whether the episode is over.
+        done = terminated or truncated
+
+        self._observation = observation
+
+        return numpy.array([[observation]], dtype=numpy.float32), reward, done
 
     def legal_actions(self):
         """
-        Should return the legal actions at each turn, if it is not available, it can return
-        the whole action space. At each turn, the game have to be able to handle one of returned actions.
+        Return the legal actions at the current turn.
 
-        For complex game where calculating legal moves is too long, the idea is to define the legal actions
-        equal to the action space but to return a negative reward if the action is illegal.
-
-        Returns:
-            An array of integers, subset of the action space.
+        CartPole always permits both actions.
         """
         return list(range(2))
 
     def reset(self):
         """
-        Reset the game for a new game.
+        Reset the game for a new episode.
 
         Returns:
-            Initial observation of the game.
+            Initial observation with shape (1, 1, 4).
         """
-        return numpy.array([[self.env.reset()]])
+        # Do not reseed every episode. Reusing the same seed on every reset
+        # would generate identical episodes.
+        observation, _ = self.env.reset()
+        self._observation = observation
+
+        return numpy.array([[observation]], dtype=numpy.float32)
 
     def close(self):
         """
-        Properly close the game.
+        Close the Gymnasium environment.
         """
         self.env.close()
 
@@ -184,20 +207,17 @@ class Game(AbstractGame):
         Display the game observation.
         """
         self.env.render()
-        input("Press enter to take a step ")
+
+        if self.render_mode == "human":
+            input("Press enter to take a step ")
 
     def action_to_string(self, action_number):
         """
-        Convert an action number to a string representing the action.
-
-        Args:
-            action_number: an integer from the action space.
-
-        Returns:
-            String representing the action.
+        Convert an action number to a human-readable string.
         """
         actions = {
             0: "Push cart to the left",
             1: "Push cart to the right",
         }
+
         return f"{action_number}. {actions[action_number]}"

@@ -367,61 +367,80 @@ class MuZero:
         self.shared_storage_worker = None
 
     def test(
-        self, render=True, opponent=None, muzero_player=None, num_tests=1, num_gpus=0
+        self,
+        render=True,
+        opponent=None,
+        muzero_player=None,
+        num_tests=1,
+        num_gpus=0,
     ):
         """
-        Test the model in a dedicated thread.
-
-        Args:
-            render (bool): To display or not the environment. Defaults to True.
-
-            opponent (str): "self" for self-play, "human" for playing against MuZero and "random"
-            for a random agent, None will use the opponent in the config. Defaults to None.
-
-            muzero_player (int): Player number of MuZero in case of multiplayer
-            games, None let MuZero play all players turn by turn, None will use muzero_player in
-            the config. Defaults to None.
-
-            num_tests (int): Number of games to average. Defaults to 1.
-
-            num_gpus (int): Number of GPUs to use, 0 forces to use the CPU. Defaults to 0.
+        Test the model in a dedicated Ray actor.
         """
+
         opponent = opponent if opponent else self.config.opponent
-        muzero_player = muzero_player if muzero_player else self.config.muzero_player
-        self_play_worker = self_play.SelfPlay.options(
-            num_cpus=0,
-            num_gpus=num_gpus,
-        ).remote(self.checkpoint, self.Game, self.config, numpy.random.randint(10000))
-        results = []
-        for i in range(num_tests):
-            print(f"Testing {i+1}/{num_tests}")
-            results.append(
-                ray.get(
-                    self_play_worker.play_game.remote(
-                        0,
-                        0,
-                        render,
-                        opponent,
-                        muzero_player,
+        muzero_player = (
+            muzero_player
+            if muzero_player is not None
+            else self.config.muzero_player
+        )
+
+        # Gymnasium requires render_mode to be selected when the
+        # environment is created. This class-level setting is read by
+        # Game.__init__ inside the Ray actor.
+        previous_render_mode = getattr(self.Game, "default_render_mode", None)
+        self.Game.default_render_mode = "human" if render else None
+
+        try:
+            self_play_worker = self_play.SelfPlay.options(
+                num_cpus=0,
+                num_gpus=num_gpus,
+            ).remote(
+                self.checkpoint,
+                self.Game,
+                self.config,
+                numpy.random.randint(10000),
+            )
+
+            results = []
+
+            for i in range(num_tests):
+                print(f"Testing {i + 1}/{num_tests}")
+
+                results.append(
+                    ray.get(
+                        self_play_worker.play_game.remote(
+                            0,
+                            0,
+                            render,
+                            opponent,
+                            muzero_player,
+                        )
                     )
                 )
-            )
-        self_play_worker.close_game.remote()
+
+            self_play_worker.close_game.remote()
+
+        finally:
+            # Prevent later training environments from being created with
+            # render_mode="human".
+            self.Game.default_render_mode = previous_render_mode
 
         if len(self.config.players) == 1:
-            result = numpy.mean([sum(history.reward_history) for history in results])
-        else:
-            result = numpy.mean(
-                [
-                    sum(
-                        reward
-                        for i, reward in enumerate(history.reward_history)
-                        if history.to_play_history[i - 1] == muzero_player
-                    )
-                    for history in results
-                ]
+            return numpy.mean(
+                [sum(history.reward_history) for history in results]
             )
-        return result
+
+        return numpy.mean(
+            [
+                sum(
+                    reward
+                    for i, reward in enumerate(history.reward_history)
+                    if history.to_play_history[i - 1] == muzero_player
+                )
+                for history in results
+            ]
+        )
 
     def load_model(self, checkpoint_path=None, replay_buffer_path=None):
         """
@@ -435,7 +454,7 @@ class MuZero:
         # Load checkpoint
         if checkpoint_path:
             checkpoint_path = pathlib.Path(checkpoint_path)
-            self.checkpoint = torch.load(checkpoint_path)
+            self.checkpoint = torch.load(checkpoint_path, weights_only=False)
             print(f"\nUsing checkpoint from {checkpoint_path}")
 
         # Load replay buffer
@@ -677,9 +696,9 @@ if __name__ == "__main__":
             elif choice == 2:
                 muzero.diagnose_model(30)
             elif choice == 3:
-                muzero.test(render=True, opponent="self", muzero_player=None)
+                muzero.test(render=True, opponent="self", muzero_player=None, num_gpus=1)
             elif choice == 4:
-                muzero.test(render=True, opponent="human", muzero_player=0)
+                muzero.test(render=True, opponent="human", muzero_player=0, num_gpus=1)
             elif choice == 5:
                 env = muzero.Game()
                 env.reset()

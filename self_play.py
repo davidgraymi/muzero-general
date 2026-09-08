@@ -14,9 +14,9 @@ class SelfPlay:
     Class which run in a dedicated thread to play games and save them to the replay-buffer.
     """
 
-    def __init__(self, initial_checkpoint, Game, config, seed):
+    def __init__(self, initial_checkpoint, Game, config, seed, render_mode=None):
         self.config = config
-        self.game = Game(seed)
+        self.game = Game(seed, render_mode)
 
         # Fix random generator seed
         numpy.random.seed(seed)
@@ -458,7 +458,10 @@ class Node:
         self.hidden_state = hidden_state
 
         policy_values = torch.softmax(
-            torch.tensor([policy_logits[0][a] for a in actions]), dim=0
+            torch.stack(
+                [policy_logits[0][a].detach() for a in actions]
+            ),
+            dim=0
         ).tolist()
         policy = {a: policy_values[i] for i, a in enumerate(actions)}
         for action, p in policy.items():
