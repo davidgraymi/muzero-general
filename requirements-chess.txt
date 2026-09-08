@@ -1,0 +1,8 @@
+gym
+nevergrad
+numpy
+ray
+seaborn
+tensorboard
+torch
+python-chess
