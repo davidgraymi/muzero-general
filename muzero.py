@@ -203,9 +203,7 @@ class MuZero:
             )
 
         if log_in_tensorboard:
-            self.logging_loop(
-                num_gpus_per_worker if self.config.selfplay_on_gpu else 0,
-            )
+            self.logging_loop(0)
 
     def logging_loop(self, num_gpus):
         """
@@ -213,7 +211,7 @@ class MuZero:
         """
         # Launch the test worker to get performance metrics
         self.test_worker = self_play.SelfPlay.options(
-            num_cpus=0,
+            num_cpus=1,
             num_gpus=num_gpus,
         ).remote(
             self.checkpoint,
