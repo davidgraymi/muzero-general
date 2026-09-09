@@ -93,7 +93,11 @@ class MuZero:
         if 1 < self.num_gpus:
             self.num_gpus = math.floor(self.num_gpus)
 
-        ray.init(num_gpus=total_gpus, ignore_reinit_error=True)
+        ray.init(
+            num_cpus=self.config.ray_num_cpus,
+            num_gpus=total_gpus,
+            ignore_reinit_error=True,
+        )
 
         # Checkpoint and replay buffer used to initialize workers
         self.checkpoint = {
@@ -117,7 +121,10 @@ class MuZero:
         }
         self.replay_buffer = {}
 
-        cpu_actor = CPUActor.remote()
+        cpu_actor = CPUActor.options(
+            num_cpus=self.config.cpu_actor_num_cpus,
+            num_gpus=0,
+        ).remote()
         cpu_weights = cpu_actor.get_initial_weights.remote(self.config)
         self.checkpoint["weights"], self.summary = copy.deepcopy(ray.get(cpu_weights))
 
@@ -139,26 +146,15 @@ class MuZero:
         if log_in_tensorboard or self.config.save_model:
             self.config.results_path.mkdir(parents=True, exist_ok=True)
 
-        # Manage GPUs
-        if 0 < self.num_gpus:
-            num_gpus_per_worker = self.num_gpus / (
-                self.config.train_on_gpu
-                + self.config.num_workers * self.config.selfplay_on_gpu
-                + log_in_tensorboard * self.config.selfplay_on_gpu
-                + self.config.use_last_model_value * self.config.reanalyse_on_gpu
-            )
-            if 1 < num_gpus_per_worker:
-                num_gpus_per_worker = math.floor(num_gpus_per_worker)
-        else:
-            num_gpus_per_worker = 0
-
         # Initialize workers
         self.training_worker = trainer.Trainer.options(
-            num_cpus=0,
-            num_gpus=num_gpus_per_worker if self.config.train_on_gpu else 0,
+            num_cpus=self.config.trainer_num_cpus,
+            num_gpus=1 if self.config.train_on_gpu and torch.cuda.is_available() else 0,
         ).remote(self.checkpoint, self.config)
 
-        self.shared_storage_worker = shared_storage.SharedStorage.remote(
+        self.shared_storage_worker = shared_storage.SharedStorage.options(
+            num_cpus=self.config.shared_storage_num_cpus,
+        ).remote(
             self.checkpoint,
             self.config,
         )
@@ -170,14 +166,20 @@ class MuZero:
 
         if self.config.use_last_model_value:
             self.reanalyse_worker = replay_buffer.Reanalyse.options(
-                num_cpus=0,
-                num_gpus=num_gpus_per_worker if self.config.reanalyse_on_gpu else 0,
+                num_cpus=self.config.reanalyse_num_cpus,
+                num_gpus=(
+                    1
+                    if self.config.reanalyse_on_gpu
+                    and torch.cuda.is_available()
+                    else 0
+                ),
+
             ).remote(self.checkpoint, self.config)
 
         self.self_play_workers = [
             self_play.SelfPlay.options(
-                num_cpus=0,
-                num_gpus=num_gpus_per_worker if self.config.selfplay_on_gpu else 0,
+                num_cpus=self.config.test_num_cpus,
+                num_gpus=1 if self.config.selfplay_on_gpu and torch.cuda.is_available() else 0,
             ).remote(
                 self.checkpoint,
                 self.Game,
@@ -211,7 +213,7 @@ class MuZero:
         """
         # Launch the test worker to get performance metrics
         self.test_worker = self_play.SelfPlay.options(
-            num_cpus=1,
+            num_cpus=self.config.test_num_cpus,
             num_gpus=num_gpus,
         ).remote(
             self.checkpoint,
@@ -319,7 +321,13 @@ class MuZero:
                 writer.add_scalar("3.Loss/Reward_loss", info["reward_loss"], counter)
                 writer.add_scalar("3.Loss/Policy_loss", info["policy_loss"], counter)
                 print(
-                    f'Last test reward: {info["total_reward"]:.2f}. Training step: {info["training_step"]}/{self.config.training_steps}. Played games: {info["num_played_games"]}. Loss: {info["total_loss"]:.2f}',
+                    f'Last test reward: {info["total_reward"]:.2f}. '
+                    f'Training step: {info["training_step"]}/'
+                    f'{self.config.training_steps}. '
+                    f'Played games: {info["num_played_games"]}. '
+                    f'Played steps: {info["num_played_steps"]}. '
+                    f'Ratio: {info["training_step"] / max(1, info["num_played_steps"]):.2f}. '
+                    f'Loss: {info["total_loss"]:.2f}',
                     end="\r",
                 )
                 counter += 1
@@ -391,7 +399,7 @@ class MuZero:
 
         try:
             self_play_worker = self_play.SelfPlay.options(
-                num_cpus=0,
+                num_cpus=self.config.test_num_cpus,
                 num_gpus=num_gpus,
             ).remote(
                 self.checkpoint,

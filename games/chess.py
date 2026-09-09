@@ -259,6 +259,14 @@ class MuZeroConfig:
         # General
         self.seed = 0
         self.max_num_gpus = 1
+        self.ray_num_cpus = 8
+        self.cpu_actor_num_cpus = 1
+        self.trainer_num_cpus = 2
+        self.selfplay_num_cpus = 2
+        self.test_num_cpus = 1
+        self.reanalyse_num_cpus = 1
+        self.replay_buffer_num_cpus = 1
+        self.shared_storage_num_cpus = 1
 
         # Game
         self.observation_shape = (119, 8, 8)
@@ -271,10 +279,10 @@ class MuZeroConfig:
         self.opponent = "expert"
 
         # Self-play
-        self.num_workers = 1
+        self.num_workers = 4
         self.selfplay_on_gpu = False
         self.max_moves = 128
-        self.num_simulations = 50
+        self.num_simulations = 10
         self.discount = 0.997
         self.temperature_threshold = None
 
@@ -345,7 +353,7 @@ class MuZeroConfig:
         # Ratio
         self.self_play_delay = 0
         self.training_delay = 0
-        self.ratio = None
+        self.ratio = 2.0
 
     def visit_softmax_temperature_fn(self, trained_steps):
         # Use stochastic search throughout initial experiments.
