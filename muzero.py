@@ -135,6 +135,15 @@ class MuZero:
         self.reanalyse_worker = None
         self.replay_buffer_worker = None
         self.shared_storage_worker = None
+        self.previous_best_weights = copy.deepcopy(self.checkpoint["weights"])
+        self.previous_best_score = 0.5
+        self.last_evaluation_step = -1
+        self.evaluation_worker = None
+        self.evaluation_task = None
+        self.evaluation_step = None
+        self.evaluation_weights = None
+        self.evaluation_status = ""
+        self.previous_best_step = 0
 
     def train(self, log_in_tensorboard=True):
         """
@@ -178,7 +187,7 @@ class MuZero:
 
         self.self_play_workers = [
             self_play.SelfPlay.options(
-                num_cpus=self.config.test_num_cpus,
+                num_cpus=self.config.selfplay_num_cpus,
                 num_gpus=1 if self.config.selfplay_on_gpu and torch.cuda.is_available() else 0,
             ).remote(
                 self.checkpoint,
@@ -209,44 +218,32 @@ class MuZero:
 
     def logging_loop(self, num_gpus):
         """
-        Keep track of the training performance.
+        Keep track of training performance and run asynchronous evaluation.
         """
-        # Launch the test worker to get performance metrics
-        self.test_worker = self_play.SelfPlay.options(
-            num_cpus=self.config.test_num_cpus,
-            num_gpus=num_gpus,
-        ).remote(
-            self.checkpoint,
-            self.Game,
-            self.config,
-            self.config.seed + self.config.num_workers,
-        )
-        self.test_worker.continuous_self_play.remote(
-            self.shared_storage_worker, None, True
-        )
-
-        # Write everything in TensorBoard
         writer = SummaryWriter(self.config.results_path)
 
         print(
-            "\nTraining...\nRun tensorboard --logdir ./results and go to http://localhost:6006/ to see in real time the training performance.\n"
+            "\nTraining...\n"
+            "Run tensorboard --logdir ./results and go to "
+            "http://localhost:6006/ to see in real time the training "
+            "performance.\n"
         )
 
-        # Save hyperparameters to TensorBoard
         hp_table = [
-            f"| {key} | {value} |" for key, value in self.config.__dict__.items()
+            f"| {key} | {value} |"
+            for key, value in self.config.__dict__.items()
         ]
+
         writer.add_text(
             "Hyperparameters",
-            "| Parameter | Value |\n|-------|-------|\n" + "\n".join(hp_table),
+            "| Parameter | Value |\n|-------|-------|\n"
+            + "\n".join(hp_table),
         )
-        # Save model representation
-        writer.add_text(
-            "Model summary",
-            self.summary,
-        )
-        # Loop for updating the training performance
+
+        writer.add_text("Model summary", self.summary)
+
         counter = 0
+
         keys = [
             "total_reward",
             "muzero_reward",
@@ -263,10 +260,101 @@ class MuZero:
             "num_played_steps",
             "num_reanalysed_games",
         ]
-        info = ray.get(self.shared_storage_worker.get_info.remote(keys))
+
+        info = ray.get(
+            self.shared_storage_worker.get_info.remote(keys)
+        )
+
+        evaluation_interval = self.config.evaluation_interval
+        next_evaluation_step = (
+            info["training_step"] // evaluation_interval + 1
+        ) * evaluation_interval
+
+        previous_status_length = 0
+
         try:
             while info["training_step"] < self.config.training_steps:
-                info = ray.get(self.shared_storage_worker.get_info.remote(keys))
+                info = ray.get(
+                    self.shared_storage_worker.get_info.remote(keys)
+                )
+
+                current_step = info["training_step"]
+
+                # Poll an existing asynchronous evaluation.
+                if self.evaluation_task is not None:
+                    ready, _ = ray.wait(
+                        [self.evaluation_task],
+                        timeout=0,
+                    )
+
+                    if ready:
+                        try:
+                            evaluation = ray.get(
+                                self.evaluation_task
+                            )
+
+                            self.report_evaluation(
+                                writer,
+                                self.evaluation_step,
+                                evaluation,
+                            )
+                        except Exception as error:
+                            self.evaluation_status = (
+                                f"Eval@{self.evaluation_step}: "
+                                f"failed: {error}"
+                            )
+                            print(
+                                f"\n{self.evaluation_status}",
+                                flush=True,
+                            )
+                        finally:
+                            if self.evaluation_worker is not None:
+                                ray.kill(
+                                    self.evaluation_worker
+                                )
+
+                            self.evaluation_worker = None
+                            self.evaluation_task = None
+                            self.evaluation_step = None
+                            self.evaluation_weights = None
+                # Start one evaluation when the interval is reached.
+                if (
+                    current_step >= next_evaluation_step
+                    and self.evaluation_task is None
+                ):
+                    checkpoint = ray.get(
+                        self.shared_storage_worker.get_checkpoint.remote()
+                    )
+
+                    self.last_evaluation_step = current_step
+                    self.evaluation_step = current_step
+                    self.evaluation_weights = copy.deepcopy(
+                        checkpoint["weights"]
+                    )
+
+                    self.evaluation_worker = (
+                        self_play.EvaluationWorker.options(
+                            num_cpus=self.config.test_num_cpus,
+                            num_gpus=0,
+                        ).remote(
+                            self.evaluation_weights,
+                            self.previous_best_weights,
+                            self.Game,
+                            self.config,
+                            self.config.seed + current_step,
+                        )
+                    )
+
+                    self.evaluation_task = (
+                        self.evaluation_worker.evaluate.remote(
+                            self.config.evaluation_games
+                        )
+                    )
+
+                    next_evaluation_step = (
+                        current_step // evaluation_interval + 1
+                    ) * evaluation_interval
+
                 writer.add_scalar(
                     "1.Total_reward/1.Total_reward",
                     info["total_reward"],
@@ -298,10 +386,14 @@ class MuZero:
                     counter,
                 )
                 writer.add_scalar(
-                    "2.Workers/2.Training_steps", info["training_step"], counter
+                    "2.Workers/2.Training_steps",
+                    info["training_step"],
+                    counter,
                 )
                 writer.add_scalar(
-                    "2.Workers/3.Self_played_steps", info["num_played_steps"], counter
+                    "2.Workers/3.Self_played_steps",
+                    info["num_played_steps"],
+                    counter,
                 )
                 writer.add_scalar(
                     "2.Workers/4.Reanalysed_games",
@@ -309,52 +401,165 @@ class MuZero:
                     counter,
                 )
                 writer.add_scalar(
-                    "2.Workers/5.Training_steps_per_self_played_step_ratio",
-                    info["training_step"] / max(1, info["num_played_steps"]),
+                    "2.Workers/"
+                    "5.Training_steps_per_self_played_step_ratio",
+                    info["training_step"]
+                    / max(1, info["num_played_steps"]),
                     counter,
                 )
-                writer.add_scalar("2.Workers/6.Learning_rate", info["lr"], counter)
                 writer.add_scalar(
-                    "3.Loss/1.Total_weighted_loss", info["total_loss"], counter
+                    "2.Workers/6.Learning_rate",
+                    info["lr"],
+                    counter,
                 )
-                writer.add_scalar("3.Loss/Value_loss", info["value_loss"], counter)
-                writer.add_scalar("3.Loss/Reward_loss", info["reward_loss"], counter)
-                writer.add_scalar("3.Loss/Policy_loss", info["policy_loss"], counter)
-                print(
+                writer.add_scalar(
+                    "3.Loss/1.Total_weighted_loss",
+                    info["total_loss"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "3.Loss/Value_loss",
+                    info["value_loss"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "3.Loss/Reward_loss",
+                    info["reward_loss"],
+                    counter,
+                )
+                writer.add_scalar(
+                    "3.Loss/Policy_loss",
+                    info["policy_loss"],
+                    counter,
+                )
+
+                status = (
                     f'Last test reward: {info["total_reward"]:.2f}. '
                     f'Training step: {info["training_step"]}/'
                     f'{self.config.training_steps}. '
                     f'Played games: {info["num_played_games"]}. '
                     f'Played steps: {info["num_played_steps"]}. '
-                    f'Ratio: {info["training_step"] / max(1, info["num_played_steps"]):.2f}. '
-                    f'Loss: {info["total_loss"]:.2f}',
-                    end="\r",
+                    f'Ratio: '
+                    f'{info["training_step"] / max(1, info["num_played_steps"]):.2f}. '
+                    f'Loss: {info["total_loss"]:.2f}'
                 )
+
+                if self.evaluation_status:
+                    status += f" | {self.evaluation_status}"
+
+                padding = max(
+                    0,
+                    previous_status_length - len(status),
+                )
+
+                print(
+                    "\r" + status + (" " * padding),
+                    end="",
+                    flush=True,
+                )
+
+                previous_status_length = len(status)
+
                 counter += 1
                 time.sleep(0.5)
+
         except KeyboardInterrupt:
             pass
+        finally:
+            writer.close()
+            self.terminate_workers()
 
-        self.terminate_workers()
+    def report_evaluation(self, writer, step, evaluation):
+        random_result = evaluation["random"]
+        previous_result = evaluation["previous"]
 
-        if self.config.save_model:
-            # Persist replay buffer to disk
-            path = self.config.results_path / "replay_buffer.pkl"
-            print(f"\n\nPersisting replay buffer games to disk at {path}")
-            pickle.dump(
-                {
-                    "buffer": self.replay_buffer,
-                    "num_played_games": self.checkpoint["num_played_games"],
-                    "num_played_steps": self.checkpoint["num_played_steps"],
-                    "num_reanalysed_games": self.checkpoint["num_reanalysed_games"],
-                },
-                open(path, "wb"),
+        metrics = []
+
+        for name, result in (
+            ("random", random_result),
+            ("previous", previous_result),
+        ):
+            if result is None:
+                continue
+
+            metrics.append(
+                f"{name} "
+                f"W/L/D={result['wins']}/"
+                f"{result['losses']}/"
+                f"{result['draws']} "
+                f"S={result['score']:.3f} "
+                f"Len={result['average_game_length']:.1f}"
             )
+
+            writer.add_scalar(
+                f"Evaluation/{name}/Wins",
+                result["wins"],
+                step,
+            )
+            writer.add_scalar(
+                f"Evaluation/{name}/Losses",
+                result["losses"],
+                step,
+            )
+            writer.add_scalar(
+                f"Evaluation/{name}/Draws",
+                result["draws"],
+                step,
+            )
+            writer.add_scalar(
+                f"Evaluation/{name}/Score",
+                result["score"],
+                step,
+            )
+            writer.add_scalar(
+                f"Evaluation/{name}/AverageGameLength",
+                result["average_game_length"],
+                step,
+            )
+
+        self.evaluation_status = (
+            f"Eval@{step}: " + " | ".join(metrics)
+        )
+
+        if (
+            previous_result is not None
+            and previous_result["score"] >= self.config.promotion_threshold
+            and self.evaluation_weights is not None
+        ):
+            self.previous_best_score = previous_result["score"]
+            self.previous_best_weights = copy.deepcopy(
+                self.evaluation_weights
+            )
+
+            self.previous_best_step = step
+
+            writer.add_scalar(
+                "Evaluation/PreviousBest/TrainingStep",
+                self.previous_best_step,
+                step,
+            )
+
+            torch.save(
+                {
+                    "weights": self.previous_best_weights,
+                    "score": self.previous_best_score,
+                    "training_step": step,
+                },
+                self.config.results_path / "best_model.checkpoint",
+            )
+
+        writer.flush()
 
     def terminate_workers(self):
         """
         Softly terminate the running tasks and garbage collect the workers.
         """
+        if self.evaluation_worker is not None:
+            ray.kill(self.evaluation_worker)
+            self.evaluation_worker = None
+            self.evaluation_task = None
+            self.evaluation_step = None
+            self.evaluation_weights = None
         if self.shared_storage_worker:
             self.shared_storage_worker.set_info.remote("terminate", True)
             self.checkpoint = ray.get(
@@ -487,6 +692,11 @@ class MuZero:
             self.checkpoint["num_played_steps"] = 0
             self.checkpoint["num_played_games"] = 0
             self.checkpoint["num_reanalysed_games"] = 0
+
+        self.previous_best_weights = copy.deepcopy(
+            self.checkpoint["weights"]
+        )
+        self.previous_best_score = 0.5
 
     def diagnose_model(self, horizon):
         """

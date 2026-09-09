@@ -282,7 +282,7 @@ class MuZeroConfig:
         self.num_workers = 4
         self.selfplay_on_gpu = False
         self.max_moves = 128
-        self.num_simulations = 10
+        self.num_simulations = 3
         self.discount = 0.997
         self.temperature_threshold = None
 
@@ -325,7 +325,7 @@ class MuZeroConfig:
         )
 
         self.save_model = True
-        self.training_steps = 5000
+        self.training_steps = 51000
         self.batch_size = 16
         self.checkpoint_interval = 100
         self.value_loss_weight = 0.25
@@ -340,7 +340,7 @@ class MuZeroConfig:
         self.lr_decay_steps = 10000
 
         # Replay
-        self.replay_buffer_size = 500
+        self.replay_buffer_size = 2000
         self.num_unroll_steps = 5
         self.td_steps = 20
         self.PER = True
@@ -353,11 +353,21 @@ class MuZeroConfig:
         # Ratio
         self.self_play_delay = 0
         self.training_delay = 0
-        self.ratio = 2.0
+        self.ratio = 1.5
+
+        # Evaluation
+        self.evaluation_interval = 10000
+        self.evaluation_games = 20
+        self.evaluation_num_simulations = 25
+        self.promotion_threshold = 0.75
 
     def visit_softmax_temperature_fn(self, trained_steps):
-        # Use stochastic search throughout initial experiments.
-        return 1.0
+        if trained_steps < 0.6 * self.training_steps:
+            return 1.0
+        elif trained_steps < 0.85 * self.training_steps:
+            return 0.5
+        else:
+            return 0.25
 
 
 class Game(AbstractGame):
@@ -366,7 +376,10 @@ class Game(AbstractGame):
     """
 
     def __init__(self, seed=None, render_mode=None):
-        self.env = Chess(seed=seed)
+        self.env = Chess(
+            seed=seed,
+            render_mode=render_mode,
+        )
 
     def step(self, action):
         """
@@ -446,29 +459,48 @@ class Chess:
     def __init__(self, seed=None, render_mode=None):
         self.seed = seed
         self.render_mode = render_mode
-
-        if seed is not None:
-            random.seed(seed)
-            numpy.random.seed(seed)
+        self.rng = random.Random(seed)
 
         self.board = chess.Board()
-
-        # Store positions from oldest to newest.
-        # The current position is included as the last item.
         self.position_history = deque(maxlen=8)
-        self.position_history.append(self.board.copy(stack=True))
+
+        self.reset()
+
+    def _apply_random_opening(self):
+        """
+        Apply a random legal opening sequence.
+        """
+        for _ in range(self.opening_plies):
+            legal_moves = list(self.board.legal_moves)
+
+            if not legal_moves:
+                break
+
+            self.board.push(
+                self.rng.choice(legal_moves)
+            )
+
+    def reset(self):
+        """
+        Reset the game and apply a new randomized opening.
+        """
+        self.board.reset()
+
+        self.opening_plies = self.rng.choice([0, 2, 4])
+        self._apply_random_opening()
+
+        self.position_history.clear()
+        self.position_history.append(
+            self.board.copy(stack=True)
+        )
+
+        return self.get_observation()
 
     def to_play(self):
         """
         Return 0 for White and 1 for Black.
         """
         return 0 if self.board.turn == chess.WHITE else 1
-
-    def reset(self):
-        self.board.reset()
-        self.position_history.clear()
-        self.position_history.append(self.board.copy(stack=True))
-        return self.get_observation()
 
     def step(self, action):
         """
@@ -641,3 +673,29 @@ class Chess:
                 print("Result: White wins")
             else:
                 print("Result: Black wins")
+
+    def copy(self):
+        copied = Chess(seed=self.seed)
+        copied.board = self.board.copy(stack=True)
+        copied.position_history = deque(
+            (
+                position.copy(stack=True)
+                for position in self.position_history
+            ),
+            maxlen=self.position_history.maxlen,
+        )
+        return copied
+
+    def apply_action_to_copy(self, action):
+        copied = self.copy()
+        copied.step(action)
+        return copied
+
+    def close(self):
+        """
+        Close the chess environment.
+
+        python-chess does not require resource cleanup, but the method is
+        required by the MuZero game wrapper.
+        """
+        pass

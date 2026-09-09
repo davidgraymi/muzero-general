@@ -147,6 +147,7 @@ class SelfPlay:
                         self.game.legal_actions(),
                         self.game.to_play(),
                         True,
+                        game_state=getattr(self.game, "env", None),
                     )
                     action = self.select_action(
                         root,
@@ -196,6 +197,7 @@ class SelfPlay:
                 self.game.legal_actions(),
                 self.game.to_play(),
                 True,
+                game_state=getattr(self.game, "env", None),
             )
             print(f'Tree depth: {mcts_info["max_tree_depth"]}')
             print(f"Root value for player {self.game.to_play()}: {root.value():.2f}")
@@ -245,6 +247,241 @@ class SelfPlay:
         return action
 
 
+@ray.remote
+class EvaluationWorker:
+    def __init__(
+        self,
+        current_weights,
+        previous_weights,
+        Game,
+        config,
+        seed,
+    ):
+        self.config = config
+        self.Game = Game
+        self.seed = seed
+
+        self.current_model = self._create_model(current_weights)
+        self.previous_model = (
+            self._create_model(previous_weights)
+            if previous_weights is not None
+            else None
+        )
+
+    def _create_model(self, weights):
+        model = models.MuZeroNetwork(self.config)
+        model.set_weights(weights)
+        model.to(torch.device("cpu"))
+        model.eval()
+        return model
+
+    def evaluate(self, num_games):
+        original_num_simulations = self.config.num_simulations
+        self.config.num_simulations = self.config.evaluation_num_simulations
+
+        try:
+            random_results = []
+            previous_results = []
+
+            for game_index in range(num_games):
+                muzero_player = game_index % 2
+
+                game = self.Game(
+                    self.seed + game_index,
+                    None,
+                )
+
+                history = self._play_against_random(
+                    game,
+                    muzero_player,
+                )
+
+                random_results.append(
+                    self._summarize(
+                        history,
+                        muzero_player,
+                    )
+                )
+
+                if self.previous_model is not None:
+                    game = self.Game(
+                        self.seed + 10000 + game_index,
+                        None,
+                    )
+
+                    history = self._play_against_previous(
+                        game,
+                        muzero_player,
+                    )
+
+                    previous_results.append(
+                        self._summarize(
+                            history,
+                            muzero_player,
+                        )
+                    )
+
+            return {
+                "random": self._aggregate(random_results),
+                "previous": (
+                    self._aggregate(previous_results)
+                    if previous_results
+                    else None
+                ),
+            }
+        finally:
+            self.config.num_simulations = original_num_simulations
+
+    def _play_against_random(self, game, muzero_player):
+        history = GameHistory()
+        observation = game.reset()
+
+        history.action_history.append(0)
+        history.observation_history.append(observation)
+        history.reward_history.append(0)
+        history.to_play_history.append(game.to_play())
+
+        done = False
+
+        with torch.no_grad():
+            while (
+                not done
+                and len(history.action_history)
+                <= self.config.max_moves
+            ):
+                stacked_observations = (
+                    history.get_stacked_observations(
+                        -1,
+                        self.config.stacked_observations,
+                        len(self.config.action_space),
+                    )
+                )
+
+                if game.to_play() == muzero_player:
+                    root, _ = MCTS(self.config).run(
+                        self.current_model,
+                        stacked_observations,
+                        game.legal_actions(),
+                        game.to_play(),
+                        False,
+                        game_state=getattr(game, "env", None),
+                    )
+                    action = SelfPlay.select_action(root, 0)
+                else:
+                    root = None
+                    action = numpy.random.choice(
+                        game.legal_actions()
+                    )
+
+                observation, reward, done = game.step(action)
+
+                history.store_search_statistics(
+                    root,
+                    self.config.action_space,
+                )
+                history.action_history.append(action)
+                history.observation_history.append(observation)
+                history.reward_history.append(reward)
+                history.to_play_history.append(game.to_play())
+
+        game.close()
+        return history
+
+    def _play_against_previous(self, game, muzero_player):
+        history = GameHistory()
+        observation = game.reset()
+
+        history.action_history.append(0)
+        history.observation_history.append(observation)
+        history.reward_history.append(0)
+        history.to_play_history.append(game.to_play())
+
+        done = False
+
+        with torch.no_grad():
+            while (
+                not done
+                and len(history.action_history)
+                <= self.config.max_moves
+            ):
+                stacked_observations = (
+                    history.get_stacked_observations(
+                        -1,
+                        self.config.stacked_observations,
+                        len(self.config.action_space),
+                    )
+                )
+
+                model = (
+                    self.current_model
+                    if game.to_play() == muzero_player
+                    else self.previous_model
+                )
+
+                root, _ = MCTS(self.config).run(
+                    model,
+                    stacked_observations,
+                    game.legal_actions(),
+                    game.to_play(),
+                    False,
+                    game_state=getattr(game, "env", None),
+                )
+
+                action = SelfPlay.select_action(root, 0)
+                observation, reward, done = game.step(action)
+
+                history.store_search_statistics(
+                    root,
+                    self.config.action_space,
+                )
+                history.action_history.append(action)
+                history.observation_history.append(observation)
+                history.reward_history.append(reward)
+                history.to_play_history.append(game.to_play())
+
+        game.close()
+        return history
+
+    @staticmethod
+    def _summarize(history, muzero_player):
+        reward = sum(
+            value
+            for index, value in enumerate(history.reward_history)
+            if history.to_play_history[index - 1] == muzero_player
+        )
+
+        return {
+            "result": (
+                "win"
+                if reward > 0
+                else "loss"
+                if reward < 0
+                else "draw"
+            ),
+            "length": len(history.action_history) - 1,
+        }
+
+    @staticmethod
+    def _aggregate(results):
+        wins = sum(item["result"] == "win" for item in results)
+        losses = sum(item["result"] == "loss" for item in results)
+        draws = sum(item["result"] == "draw" for item in results)
+        games = len(results)
+
+        return {
+            "wins": wins,
+            "losses": losses,
+            "draws": draws,
+            "games": games,
+            "score": (wins + 0.5 * draws) / max(1, games),
+            "average_game_length": float(
+                numpy.mean(
+                    [item["length"] for item in results]
+                )
+            ),
+        }
+
+
 # Game independent
 class MCTS:
     """
@@ -265,46 +502,61 @@ class MCTS:
         to_play,
         add_exploration_noise,
         override_root_with=None,
+        game_state=None,
     ):
         """
-        At the root of the search tree we use the representation function to obtain a
-        hidden state given the current observation.
-        We then run a Monte Carlo Tree Search using only action sequences and the model
-        learned by the network.
+        Run Monte Carlo Tree Search from the current position.
+
+        For chess, game_state is the underlying Chess environment. It is
+        copied into tree nodes so that legal actions can be generated at
+        every imagined position.
         """
-        if override_root_with:
+        if override_root_with is not None:
             root = override_root_with
             root_predicted_value = None
         else:
             root = Node(0)
+
             observation = (
                 torch.tensor(observation)
                 .float()
                 .unsqueeze(0)
                 .to(next(model.parameters()).device)
             )
+
             (
                 root_predicted_value,
                 reward,
                 policy_logits,
                 hidden_state,
             ) = model.initial_inference(observation)
+
             root_predicted_value = models.support_to_scalar(
-                root_predicted_value, self.config.support_size
+                root_predicted_value,
+                self.config.support_size,
             ).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
-            assert (
-                legal_actions
-            ), f"Legal actions should not be an empty array. Got {legal_actions}."
+
+            reward = models.support_to_scalar(
+                reward,
+                self.config.support_size,
+            ).item()
+
+            assert legal_actions, (
+                "Legal actions should not be empty. "
+                f"Got {legal_actions}."
+            )
+
             assert set(legal_actions).issubset(
                 set(self.config.action_space)
-            ), "Legal actions should be a subset of the action space."
+            ), "Legal actions must be a subset of the action space."
+
             root.expand(
                 legal_actions,
                 to_play,
                 reward,
                 policy_logits,
                 hidden_state,
+                game_state,
             )
 
         if add_exploration_noise:
@@ -314,8 +566,8 @@ class MCTS:
             )
 
         min_max_stats = MinMaxStats()
-
         max_tree_depth = 0
+
         for _ in range(self.config.num_simulations):
             virtual_to_play = to_play
             node = root
@@ -324,40 +576,95 @@ class MCTS:
 
             while node.expanded():
                 current_tree_depth += 1
-                action, node = self.select_child(node, min_max_stats)
+
+                action, node = self.select_child(
+                    node,
+                    min_max_stats,
+                )
+
                 search_path.append(node)
 
-                # Players play turn by turn
                 if virtual_to_play + 1 < len(self.config.players):
-                    virtual_to_play = self.config.players[virtual_to_play + 1]
+                    virtual_to_play = self.config.players[
+                        virtual_to_play + 1
+                    ]
                 else:
                     virtual_to_play = self.config.players[0]
 
-            # Inside the search tree we use the dynamics function to obtain the next hidden
-            # state given an action and the previous hidden state
             parent = search_path[-2]
-            value, reward, policy_logits, hidden_state = model.recurrent_inference(
-                parent.hidden_state,
-                torch.tensor([[action]]).to(parent.hidden_state.device),
+
+            action_tensor = torch.tensor(
+                [[action]],
+                dtype=torch.long,
+                device=parent.hidden_state.device,
             )
-            value = models.support_to_scalar(value, self.config.support_size).item()
-            reward = models.support_to_scalar(reward, self.config.support_size).item()
+
+            (
+                value,
+                reward,
+                policy_logits,
+                hidden_state,
+            ) = model.recurrent_inference(
+                parent.hidden_state,
+                action_tensor,
+            )
+
+            value = models.support_to_scalar(
+                value,
+                self.config.support_size,
+            ).item()
+
+            reward = models.support_to_scalar(
+                reward,
+                self.config.support_size,
+            ).item()
+
+            if node.game_state is not None:
+                node_legal_actions = node.game_state.legal_actions()
+
+                if not node_legal_actions:
+                    self.backpropagate(
+                        search_path,
+                        value,
+                        virtual_to_play,
+                        min_max_stats,
+                    )
+
+                    max_tree_depth = max(
+                        max_tree_depth,
+                        current_tree_depth,
+                    )
+
+                    continue
+            else:
+                node_legal_actions = self.config.action_space
+
             node.expand(
-                self.config.action_space,
+                node_legal_actions,
                 virtual_to_play,
                 reward,
                 policy_logits,
                 hidden_state,
+                node.game_state,
             )
 
-            self.backpropagate(search_path, value, virtual_to_play, min_max_stats)
+            self.backpropagate(
+                search_path,
+                value,
+                virtual_to_play,
+                min_max_stats,
+            )
 
-            max_tree_depth = max(max_tree_depth, current_tree_depth)
+            max_tree_depth = max(
+                max_tree_depth,
+                current_tree_depth,
+            )
 
         extra_info = {
             "max_tree_depth": max_tree_depth,
             "root_predicted_value": root_predicted_value,
         }
+
         return root, extra_info
 
     def select_child(self, node, min_max_stats):
@@ -439,6 +746,7 @@ class Node:
         self.children = {}
         self.hidden_state = None
         self.reward = 0
+        self.game_state = None
 
     def expanded(self):
         return len(self.children) > 0
@@ -448,7 +756,7 @@ class Node:
             return 0
         return self.value_sum / self.visit_count
 
-    def expand(self, actions, to_play, reward, policy_logits, hidden_state):
+    def expand(self, actions, to_play, reward, policy_logits, hidden_state, game_state=None):
         """
         We expand a node using the value, reward and policy prediction obtained from the
         neural network.
@@ -456,16 +764,33 @@ class Node:
         self.to_play = to_play
         self.reward = reward
         self.hidden_state = hidden_state
+        self.game_state = game_state
+
+        action_tensor = torch.as_tensor(
+            actions,
+            dtype=torch.long,
+            device=policy_logits.device,
+        )
+
+        action_logits = policy_logits[0].index_select(
+            0,
+            action_tensor,
+        )
 
         policy_values = torch.softmax(
-            torch.stack(
-                [policy_logits[0][a].detach() for a in actions]
-            ),
-            dim=0
-        ).tolist()
-        policy = {a: policy_values[i] for i, a in enumerate(actions)}
-        for action, p in policy.items():
-            self.children[action] = Node(p)
+            action_logits,
+            dim=0,
+        ).detach().cpu().tolist()
+
+        for action, prior in zip(actions, policy_values):
+            child = Node(float(prior))
+
+            if game_state is not None:
+                child.game_state = (
+                    game_state.apply_action_to_copy(action)
+                )
+
+            self.children[int(action)] = child
 
     def add_exploration_noise(self, dirichlet_alpha, exploration_fraction):
         """
